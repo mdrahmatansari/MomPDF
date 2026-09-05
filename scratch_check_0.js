@@ -1,0 +1,1 @@
+window.mompdfTool = "crop_pdf";

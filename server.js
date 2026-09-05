@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -10,6 +11,10 @@ const pdfService = require('./services/pdfService');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Initialize global progress map
+global.progressMap = new Map();
+global.docCache = new Map();
 
 // Directories
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
@@ -48,7 +53,10 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 100 * 1024 * 1024 * 1024 } // 100GB Limit
+  limits: {
+    fileSize: 100 * 1024 * 1024 * 1024, // 100GB Limit for files
+    fieldSize: 50 * 1024 * 1024 // 50MB Limit for text fields (like base64 images)
+  }
 });
 
 // Helper to save processed buffer to disk and return metadata
@@ -101,6 +109,7 @@ app.post('/api/process', upload.array('files', 500), async (req, res) => {
   const tool = (req.body.tool || 'merge').toLowerCase().replace(/[^a-z0-9_-]/g, '');
   const files = req.files || [];
   const options = req.body || {};
+  const taskId = req.body.taskId;
 
   if (!files.length && tool !== 'html-to-pdf') {
     return res.status(400).json({
@@ -113,6 +122,10 @@ app.post('/api/process', upload.array('files', 500), async (req, res) => {
     let result;
     const firstFile = files[0];
     let fileBuffers = [];
+
+    if (taskId) {
+      global.progressMap.set(taskId, { progress: 70, message: 'Processing started...' });
+    }
 
     // Safely load buffers into memory and handle Node.js physical limits
     try {
@@ -205,6 +218,7 @@ app.post('/api/process', upload.array('files', 500), async (req, res) => {
 
       case 'protect':
       case 'protect-pdf':
+      case 'protect_pdf':
         const protectedBuffer = await pdfService.protect(fileBuffers[0], options);
         result = saveProcessedFile(protectedBuffer, firstFile.originalname, 'protected');
         break;
@@ -223,11 +237,13 @@ app.post('/api/process', upload.array('files', 500), async (req, res) => {
 
       case 'organize':
       case 'organize-pdf':
-        const organizedBuffer = await pdfService.organize(fileBuffers[0], options);
+      case 'organize_pdf':
+        const organizedBuffer = await pdfService.organize(fileBuffers, options);
         result = saveProcessedFile(organizedBuffer, firstFile.originalname, 'organized');
         break;
 
       case 'remove-pages':
+      case 'remove_pages':
         const removedBuffer = await pdfService.removePages(fileBuffers[0], options);
         result = saveProcessedFile(removedBuffer, firstFile.originalname, 'pages_removed');
         break;
@@ -236,11 +252,13 @@ app.post('/api/process', upload.array('files', 500), async (req, res) => {
       case 'jpg-to-pdf':
       case 'image_to_pdf':
         const imgPdfBuffer = await pdfService.jpgToPdf(fileBuffers, options);
-        result = saveProcessedFile(imgPdfBuffer, firstFile.originalname, 'to_PDF');
+        result = saveProcessedFile(imgPdfBuffer, firstFile.originalname.replace(/\.(jpe?g|png|webp|bmp)$/i, '.pdf'), 'to_PDF');
         break;
 
       case 'pdf_to_jpg':
       case 'pdf-to-jpg':
+        // Attach taskId to options
+        if (taskId) options.taskId = taskId;
         const jpgList = await pdfService.pdfToJpg(fileBuffers[0], options);
         if (jpgList.length === 1) {
           result = saveProcessedFile(jpgList[0].buffer, 'page_1.jpg', 'mompdf');
@@ -304,7 +322,7 @@ app.post('/api/process', upload.array('files', 500), async (req, res) => {
       case 'pdf_to_powerpoint':
       case 'pdf-to-powerpoint':
         const pptBuffer = await pdfService.pdfToPowerpoint(fileBuffers[0], options);
-        result = saveProcessedFile(pptBuffer, firstFile.originalname.replace(/\.pdf$/i, '.docx'), 'pdf_to_ppt');
+        result = saveProcessedFile(pptBuffer, firstFile.originalname.replace(/\.pdf$/i, '.pptx'), 'pdf_to_ppt');
         break;
 
       case 'ocr-pdf':
@@ -315,17 +333,22 @@ app.post('/api/process', upload.array('files', 500), async (req, res) => {
 
       case 'pdf-summarize':
       case 'summarize':
-        const summary = await pdfService.summarize(fileBuffers[0], options);
-        // Create both JSON summary and download-able text
-        const summaryTxt = Buffer.from(
-          `MomPDF AI SUMMARY\n` +
-          `====================================\n\n` +
-          `Executive Summary:\n${summary.executiveSummary}\n\n` +
-          `Key Highlights:\n` +
-          summary.keyHighlights.map((k) => `${k.id}. ${k.highlight}`).join('\n')
-        );
-        result = saveProcessedFile(summaryTxt, `${firstFile.originalname}_summary.txt`, 'summary');
-        result.summaryData = summary;
+      case 'pdf_summarize':
+        const summarizeResult = await pdfService.summarize(fileBuffers[0], options);
+        // The service already created the PDF buffer for the summary, so we just save it.
+        result = saveProcessedFile(summarizeResult.pdfBuffer, `${firstFile.originalname}_summary.pdf`, 'summary');
+        
+        // We also want to provide the raw text file
+        const summaryTxt = Buffer.from(summarizeResult.summaryText);
+        const txtResult = saveProcessedFile(summaryTxt, `${firstFile.originalname}_summary.txt`, 'summary');
+        
+        // Return custom data back to frontend so it can display the UI
+        result.summaryData = {
+          docId: summarizeResult.docId,
+          summaryText: summarizeResult.summaryText,
+          txtDownloadUrl: txtResult.downloadUrl,
+          pdfDownloadUrl: result.downloadUrl
+        };
         break;
 
       case 'translate-pdf':
@@ -402,6 +425,7 @@ app.post('/api/process', upload.array('files', 500), async (req, res) => {
 
     // Clean up uploaded temp files
     cleanupFiles(files);
+    if (taskId) global.progressMap.delete(taskId);
 
     res.json({
       success: true,
@@ -410,11 +434,84 @@ app.post('/api/process', upload.array('files', 500), async (req, res) => {
     });
   } catch (error) {
     cleanupFiles(files);
+    if (taskId) global.progressMap.delete(taskId);
     console.error(`Error processing tool [${tool}]:`, error);
     res.status(500).json({
       success: false,
       message: error.message || "We couldn't process your file right now. Please try again."
     });
+  }
+});
+
+// Get Progress Endpoint
+app.get('/api/progress/:taskId', (req, res) => {
+  const { taskId } = req.params;
+  if (global.progressMap.has(taskId)) {
+    res.json(global.progressMap.get(taskId));
+  } else {
+    res.json({ progress: 100, message: 'Completed or not found' });
+  }
+});
+
+// AI Ask Anything Endpoint
+app.post('/api/ask', express.json(), async (req, res) => {
+  const { docId, question, history } = req.body;
+  if (!docId || !global.docCache.has(docId)) {
+    return res.status(404).json({ success: false, message: 'Document session expired or not found. Please summarize again.' });
+  }
+  if (!question) {
+    return res.status(400).json({ success: false, message: 'Question is required.' });
+  }
+  
+  try {
+    const docData = global.docCache.get(docId);
+    const { GoogleGenerativeAI } = require('@google/generative-ai');
+    
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      throw new Error('GEMINI_API_KEY is not configured on the server.');
+    }
+    
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: 'gemini-3.5-flash' });
+    
+    const prompt = `You are a helpful AI assistant answering questions about a document. 
+Base your answers ONLY on the provided document text. If the answer is not in the text, say you don't know.
+    
+DOCUMENT CONTENT:
+"""
+${docData.text}
+"""
+
+USER QUESTION: ${question}
+    `;
+    
+    // We are currently doing single-turn QA with document context included for simplicity and statelessness,
+    // although history is passed from frontend, we can just prepend it to the prompt.
+    let fullPrompt = prompt;
+    if (history && history.length > 0) {
+      let historyText = history.map(msg => `${msg.role === 'user' ? 'USER' : 'AI'}: ${msg.text}`).join('\n');
+      fullPrompt = `You are a helpful AI assistant. Answer the user's latest question based ONLY on the document text.
+      
+DOCUMENT CONTENT:
+"""
+${docData.text}
+"""
+
+CONVERSATION HISTORY:
+${historyText}
+
+USER LATEST QUESTION: ${question}
+      `;
+    }
+
+    const result = await model.generateContent(fullPrompt);
+    const responseText = result.response.text();
+    
+    res.json({ success: true, answer: responseText });
+  } catch (err) {
+    console.error('Ask Anything Error:', err);
+    res.status(500).json({ success: false, message: 'AI failed to answer: ' + err.message });
   }
 });
 

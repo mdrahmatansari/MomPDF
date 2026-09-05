@@ -17,7 +17,7 @@
 
   <link rel="stylesheet" href="css/mompdf.ui.css">
   <link rel="stylesheet" href="css/mompdf.workspace.css">
-  <script>window.mompdfTool = "crop-pdf";</script>
+  <script>window.mompdfTool = "crop_pdf";</script>
 </head>
 
 <body>
@@ -1603,8 +1603,352 @@
   </div>
 
   <script src="js/mompdf.i18n.js"></script>
-  <script src="js/mompdf.workspace.js"></script>
+  <script src="js/mompdf.workspace.js?v=1788454052239"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+  <script>
+    // Custom Crop JS
+    let currentPdf = null;
+    let currentScale = 0; // 0 means not calculated yet
+    let pageNum = 1;
+    let totalPages = 1;
+    let pdfFile = null;
+    let isDragging = false;
+    let isResizing = false;
+    let resizeHandle = null;
+    let cropBoxData = { x: 0, y: 0, w: 0, h: 0 };
+    let startX, startY;
 
+    let canvas, ctx, cropBox, canvasWrapper;
+
+    // Load PDF.js worker
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js";
+
+    // Intercept mompdfWorkspace to inject our custom UI directly into its layout
+    window.addEventListener('load', () => {
+      if (window.mompdfWorkspace) {
+        const origLoadFiles = window.mompdfWorkspace.loadFilesIntoStudio.bind(window.mompdfWorkspace);
+        window.mompdfWorkspace.loadFilesIntoStudio = async function (files) {
+          if (files && files.length > 0) {
+
+            // 1. Let the workspace build the standard layout headers/footers
+            // But first, override the renderControls for crop_pdf on the instance!
+            this.toolDef.renderControls = () => `
+              <div style="background: #e0f2fe; color: #0284c7; padding: 16px; border-radius: 8px; margin-bottom: 24px; display: flex; gap: 12px; align-items: flex-start; font-size: 13px; line-height: 1.5;">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink: 0; margin-top: 1px;"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
+                <div>Click and drag to select the area you want to keep. Resize if needed.</div>
+              </div>
+              <div style="text-align: right; margin-bottom: 20px;">
+                <a href="#" id="cropResetBtn" style="color: var(--danger); font-size: 14px; text-decoration: underline; font-weight: 500; cursor: pointer;">Reset all</a>
+              </div>
+              <div class="control-item">
+                <div class="control-item-label">Pages:</div>
+                <div style="display: flex; gap: 20px; align-items: center; margin-top: 10px;">
+                  <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 14px; color: var(--text-color);">
+                    <input type="radio" name="cropPages" value="all" checked style="accent-color: var(--primary); width: 16px; height: 16px;" /> All pages
+                  </label>
+                  <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 14px; color: var(--text-color);">
+                    <input type="radio" name="cropPages" value="current" style="accent-color: var(--primary); width: 16px; height: 16px;" /> Current page
+                  </label>
+                </div>
+              </div>
+            `;
+
+            origLoadFiles(files);
+
+            // 2. Inject our viewer into the canvas area
+            const canvasArea = document.getElementById('canvasContentArea');
+            canvasArea.innerHTML = `
+              <div id="cropViewerContainer" style="position: relative; overflow: auto; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #f8fafc; width: 100%; height: 75vh; min-height: 500px; border-radius: 8px; border: 1px solid #e2e8f0;">
+                <div id="cropCanvasWrapper" style="position: relative; box-shadow: 0 4px 12px rgba(0,0,0,0.15); margin: 40px auto; background: white;">
+                  <canvas id="cropPdfCanvas"></canvas>
+                  <div id="cropBox" style="position: absolute; border: 2px dashed var(--primary); background: rgba(59, 130, 246, 0.1); cursor: move; box-sizing: border-box;">
+                    <div class="resize-handle nw" style="position: absolute; top: -5px; left: -5px; width: 10px; height: 10px; background: var(--primary); border-radius: 50%; cursor: nwse-resize;"></div>
+                    <div class="resize-handle ne" style="position: absolute; top: -5px; right: -5px; width: 10px; height: 10px; background: var(--primary); border-radius: 50%; cursor: nesw-resize;"></div>
+                    <div class="resize-handle sw" style="position: absolute; bottom: -5px; left: -5px; width: 10px; height: 10px; background: var(--primary); border-radius: 50%; cursor: nesw-resize;"></div>
+                    <div class="resize-handle se" style="position: absolute; bottom: -5px; right: -5px; width: 10px; height: 10px; background: var(--primary); border-radius: 50%; cursor: nwse-resize;"></div>
+                  </div>
+                </div>
+                
+                <style>
+                  #cropToolbar {
+                    position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%) translateY(20px);
+                    background: #2b2b2b; color: white; padding: 8px 12px; border-radius: 8px;
+                    display: flex; align-items: center; gap: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.4);
+                    opacity: 0; visibility: hidden; transition: all 0.2s ease; z-index: 10000;
+                  }
+                  #cropViewerContainer:hover #cropToolbar { opacity: 1; visibility: visible; transform: translateX(-50%) translateY(0); }
+                  .ct-btn { background: transparent; border: none; color: white; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 6px; border-radius: 4px; transition: background 0.2s; }
+                  .ct-btn:hover { background: rgba(255,255,255,0.15); }
+                  .ct-input { background: #444; color: white; border: 1px solid #555; border-radius: 4px; padding: 4px 8px; text-align: center; font-size: 14px; outline: none; width: 45px; font-weight: 500; }
+                  .ct-divider { width: 1px; height: 24px; background: #555; margin: 0 2px; }
+                </style>
+                <div id="cropToolbar">
+                  <button id="cropPrevPage" class="ct-btn" title="Previous Page"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"></polyline></svg></button>
+                  <button id="cropNextPage" class="ct-btn" title="Next Page"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg></button>
+                  
+                  <div style="display: flex; align-items: center; gap: 8px; margin: 0 4px;">
+                    <input type="number" id="cropPageInput" value="1" min="1" class="ct-input" />
+                    <span style="color: #cbd5e1; font-size: 14px; font-weight: 500;">/ <span id="cropTotalPages">1</span></span>
+                  </div>
+                  
+                  <div class="ct-divider"></div>
+                  
+                  <button id="cropZoomOut" class="ct-btn" title="Zoom Out"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="8" y1="12" x2="16" y2="12"></line></svg></button>
+                  <button id="cropZoomIn" class="ct-btn" title="Zoom In"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="16"></line><line x1="8" y1="12" x2="16" y2="12"></line></svg></button>
+                  <div class="ct-input" id="cropZoomText" style="width: 55px; cursor: default;">100%</div>
+                  <div class="ct-divider"></div>
+                  <button id="cropFitWidthBtn" class="ct-btn" title="Fit Width"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="12" x2="2" y2="12"></line><polyline points="5 15 2 12 5 9"></polyline><polyline points="19 15 22 12 19 9"></polyline><line x1="22" y1="4" x2="22" y2="20"></line><line x1="2" y1="4" x2="2" y2="20"></line></svg></button>
+                  <div class="ct-divider"></div>
+                  <button id="cropSettingsBtn" class="ct-btn" title="Settings"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path><circle cx="12" cy="12" r="3"></circle></svg></button>
+                </div>
+              </div>
+            `;
+
+            // Rename the main action button and clear previous listeners
+            const oldMainBtn = document.getElementById('mainActionBtn');
+            if (oldMainBtn) {
+              const mainBtn = oldMainBtn.cloneNode(true);
+              oldMainBtn.parentNode.replaceChild(mainBtn, oldMainBtn);
+              mainBtn.id = 'mainActionBtn';
+              mainBtn.innerHTML = `Crop PDF &rarr;`;
+              mainBtn.style.fontSize = '18px';
+              mainBtn.style.padding = '14px';
+              mainBtn.type = 'button';
+              mainBtn.onclick = handleCropSubmit;
+            }
+
+            // Bind global variables
+            canvas = document.getElementById('cropPdfCanvas');
+            ctx = canvas.getContext('2d');
+            cropBox = document.getElementById('cropBox');
+            canvasWrapper = document.getElementById('cropCanvasWrapper');
+
+            pdfFile = files[0];
+            const arrayBuffer = await pdfFile.arrayBuffer();
+            currentPdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+            totalPages = currentPdf.numPages;
+            document.getElementById('cropTotalPages').innerText = totalPages;
+
+            bindCropEvents();
+
+            currentScale = 0; // reset for auto-fit on render
+            await renderPage(1);
+          } else {
+            origLoadFiles(files);
+          }
+        };
+      }
+    });
+
+    async function renderPage(num) {
+      if (!currentPdf) return;
+      const page = await currentPdf.getPage(num);
+
+      // Auto-fit calculate on first render
+      if (currentScale === 0) {
+        const container = document.getElementById('cropViewerContainer');
+        const unscaled = page.getViewport({ scale: 1.0 });
+        // Leave 60px padding on width and height
+        const scaleW = (container.clientWidth - 80) / unscaled.width;
+        const scaleH = (container.clientHeight - 80) / unscaled.height;
+        const fitScale = Math.min(scaleW, scaleH);
+        currentScale = fitScale < 1.0 ? fitScale : 1.0;
+      }
+
+      const viewport = page.getViewport({ scale: currentScale });
+
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      canvasWrapper.style.width = viewport.width + 'px';
+      canvasWrapper.style.height = viewport.height + 'px';
+
+      await page.render({
+        canvasContext: ctx,
+        viewport: viewport
+      }).promise;
+
+      resetCropBox();
+      document.getElementById('cropPageInput').value = num;
+      document.getElementById('cropZoomText').innerText = Math.round(currentScale * 100) + '%';
+    }
+
+    function resetCropBox() {
+      cropBoxData = { x: 0, y: 0, w: canvas.width, h: canvas.height };
+      updateCropBoxDOM();
+    }
+
+    function updateCropBoxDOM() {
+      cropBox.style.left = cropBoxData.x + 'px';
+      cropBox.style.top = cropBoxData.y + 'px';
+      cropBox.style.width = cropBoxData.w + 'px';
+      cropBox.style.height = cropBoxData.h + 'px';
+    }
+
+    function bindCropEvents() {
+      // Drag and resize logic
+      canvasWrapper.addEventListener('mousedown', (e) => {
+        const rect = canvasWrapper.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        if (e.target.classList.contains('resize-handle')) {
+          isResizing = true; resizeHandle = e.target.className.split(' ')[1];
+          startX = e.clientX; startY = e.clientY;
+        } else if (e.target === cropBox || cropBox.contains(e.target)) {
+          isDragging = true; startX = e.clientX; startY = e.clientY;
+        } else {
+          cropBoxData = { x: x, y: y, w: 0, h: 0 };
+          isResizing = true; resizeHandle = 'se';
+          startX = e.clientX; startY = e.clientY;
+          updateCropBoxDOM();
+        }
+      });
+
+      window.addEventListener('mousemove', (e) => {
+        if (!isDragging && !isResizing) return;
+        const dx = e.clientX - startX; const dy = e.clientY - startY;
+        startX = e.clientX; startY = e.clientY;
+        if (isDragging) {
+          cropBoxData.x = Math.max(0, Math.min(canvas.width - cropBoxData.w, cropBoxData.x + dx));
+          cropBoxData.y = Math.max(0, Math.min(canvas.height - cropBoxData.h, cropBoxData.y + dy));
+        } else if (isResizing) {
+          if (resizeHandle.includes('e')) cropBoxData.w = Math.max(10, Math.min(canvas.width - cropBoxData.x, cropBoxData.w + dx));
+          if (resizeHandle.includes('s')) cropBoxData.h = Math.max(10, Math.min(canvas.height - cropBoxData.y, cropBoxData.h + dy));
+          if (resizeHandle.includes('w')) {
+            const oldX = cropBoxData.x; cropBoxData.x = Math.max(0, Math.min(cropBoxData.x + cropBoxData.w - 10, cropBoxData.x + dx));
+            cropBoxData.w += (oldX - cropBoxData.x);
+          }
+          if (resizeHandle.includes('n')) {
+            const oldY = cropBoxData.y; cropBoxData.y = Math.max(0, Math.min(cropBoxData.y + cropBoxData.h - 10, cropBoxData.y + dy));
+            cropBoxData.h += (oldY - cropBoxData.y);
+          }
+        }
+        updateCropBoxDOM();
+      });
+
+      window.addEventListener('mouseup', () => { isDragging = false; isResizing = false; resizeHandle = null; });
+
+      document.getElementById('cropPrevPage').onclick = () => { if (pageNum > 1) { pageNum--; renderPage(pageNum); } };
+      document.getElementById('cropNextPage').onclick = () => { if (pageNum < totalPages) { pageNum++; renderPage(pageNum); } };
+      document.getElementById('cropZoomIn').onclick = () => { if (currentScale < 3.0) { currentScale += 0.2; renderPage(pageNum); } };
+      document.getElementById('cropZoomOut').onclick = () => { if (currentScale > 0.4) { currentScale -= 0.2; renderPage(pageNum); } };
+      document.getElementById('cropFitWidthBtn').onclick = () => { currentScale = 0; renderPage(pageNum); };
+
+      document.getElementById('cropResetBtn').onclick = (e) => { e.preventDefault(); resetCropBox(); };
+
+      document.getElementById('cropSettingsBtn').onclick = (e) => {
+        const sidebar = document.getElementById('toolSpecificSidebar');
+        if (sidebar) {
+          sidebar.style.boxShadow = '0 0 15px rgba(59, 130, 246, 0.5)';
+          sidebar.style.transition = 'box-shadow 0.3s ease';
+          setTimeout(() => { sidebar.style.boxShadow = 'none'; }, 800);
+        }
+      };
+    }
+
+    async function handleCropSubmit() {
+      if (cropBoxData.w < 20 || cropBoxData.h < 20) {
+        alert("Please draw or adjust the crop box to a valid size before cropping.");
+        return;
+      }
+
+      const studioStage = document.getElementById('studioStage');
+      const processingStage = document.getElementById('processingStage');
+      const successStage = document.getElementById('successStage');
+      
+      if (studioStage && processingStage) {
+        studioStage.style.display = 'none';
+        processingStage.style.display = 'block';
+      }
+
+      const scaleFactor = 1.0 / currentScale;
+      const actX = cropBoxData.x * scaleFactor;
+      const actY = cropBoxData.y * scaleFactor;
+      const actW = cropBoxData.w * scaleFactor;
+      const actH = cropBoxData.h * scaleFactor;
+
+      const pageMode = document.querySelector('input[name="cropPages"]:checked').value;
+
+      const formData = new FormData();
+      formData.append('files', pdfFile);
+      formData.append('x', actX);
+      formData.append('y', actY);
+      formData.append('width', actW);
+      formData.append('height', actH);
+      formData.append('pageMode', pageMode);
+      formData.append('currentPage', pageNum);
+      formData.append('tool', 'crop-pdf');
+
+      try {
+        const response = await fetch('/api/process', { method: 'POST', body: formData });
+        
+        // Ensure we handle non-OK responses gracefully
+        let data;
+        try {
+           data = await response.json();
+        } catch(e) {
+           throw new Error('Server returned an invalid response.');
+        }
+
+        if (!response.ok || !data.success) {
+           throw new Error((data && data.message) ? data.message : 'Processing failed');
+        }
+
+        if (data.success && data.data && data.data.downloadUrl) {
+          if (processingStage) processingStage.style.display = 'none';
+          if (successStage) successStage.style.display = 'block';
+          
+          document.getElementById('successTitle') && (document.getElementById('successTitle').innerText = 'Task Completed!');
+          document.getElementById('successDesc') && (document.getElementById('successDesc').innerText = 'Your PDF has been cropped successfully.');
+          document.getElementById('successFileName') && (document.getElementById('successFileName').innerText = data.data.filename || 'mompdf_cropped.pdf');
+          
+          const btn = document.getElementById('downloadResultBtn');
+          if (btn) {
+            btn.innerText = 'Download PDF';
+            btn.style.display = 'inline-flex';
+            btn.href = '#';
+            btn.onclick = async (e) => {
+              e.preventDefault();
+              const originalText = btn.innerText;
+              btn.innerText = 'Downloading...';
+              try {
+                const downloadRes = await fetch(data.data.downloadUrl);
+                if (!downloadRes.ok) throw new Error('Download failed');
+                const blob = await downloadRes.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = data.data.filename || 'cropped_document.pdf';
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                window.URL.revokeObjectURL(url);
+              } catch (err) {
+                console.error(err);
+                alert("Failed to download the file directly. You can try right-clicking the button and selecting 'Save Link As'.");
+              } finally {
+                btn.innerText = originalText;
+              }
+            };
+            btn.removeAttribute('disabled');
+          }
+        } else {
+          throw new Error('Server did not return a valid download link');
+        }
+      } catch (err) {
+          if (processingStage) processingStage.style.display = 'none';
+          if (successStage) successStage.style.display = 'block';
+
+          document.getElementById('successTitle') && (document.getElementById('successTitle').innerText = 'Error');
+          document.getElementById('successDesc') && (document.getElementById('successDesc').innerText = err.message);
+          
+          const btn = document.getElementById('downloadResultBtn');
+          if (btn) {
+            btn.innerText = 'Try Again';
+            btn.style.display = 'inline-flex';
+            btn.href = '#';
+            btn.onclick = (e) => { e.preventDefault(); window.location.reload(); };
+          }
+      }
+    }
+  </script>
 </body>
-
-</html>
